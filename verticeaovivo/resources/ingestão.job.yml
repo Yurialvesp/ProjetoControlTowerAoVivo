@@ -1,0 +1,94 @@
+# Job principal da Torre de Controle (Projeto Farol · Vértice Tecnologia)
+# As 7 tarefas do DAG:
+#   1. IngestaoAPI          — Busca os feriados nacionais de 2026 na BrasilAPI, grava no Volume raw e recria bronze.feriados (paralelo com IngestaoAWS)
+#   2. IngestaoAWS          — Baixa os arquivos do data lake S3 (Supabase Storage) com boto3 para o Volume raw e carrega as 9 tabelas bronze
+#   3. conferencia_bronze   — Confere se as 9 tabelas da bronze têm a contagem exata esperada (seed 42), falhando com raise_error() se divergir
+#   4. medalhao             — Roda o pipeline Lakeflow Spark Declarative Pipelines (vertice_medalhao): 7 Materialized Views na silver e 3 na gold
+#   5. testes_de_qualidade  — Executa os 10 testes de qualidade entre bronze, silver e gold (em paralelo com status_com_ia)
+#   6. status_com_ia        — Classifica e extrai bloqueios de silver.status_semanal em gold.status_estruturado com MERGE incremental e AI Functions v2.0
+#   7. metricas_governadas  — Cria/atualiza a metric view gold.mv_projetos (depois de testes_de_qualidade e status_com_ia)
+
+variables:
+  s3_access_key_id:
+    description: chave do data lake (o valor fica fora do Git)
+  s3_secret_access_key:
+    description: chave do data lake (o valor fica fora do Git)
+
+resources:
+  jobs:
+    ingestão:
+      name: Ingestão
+      tasks:
+        - task_key: IngestaoAPI
+          disabled: false
+          email_notifications: {}
+          notebook_task:
+            notebook_path: ../src/01_ingestao_api_gabarito.py
+            source: WORKSPACE
+          run_if: ALL_SUCCESS
+          timeout_seconds: 0
+          webhook_notifications: {}
+        - task_key: IngestaoAWS
+          disabled: false
+          email_notifications: {}
+          notebook_task:
+            base_parameters:
+              AWS_ACCESS_KEY_ID: ${var.s3_access_key_id}
+              AWS_DEFAULT_REGION: us-west-2
+              AWS_SECRET_ACCESS_KEY: ${var.s3_secret_access_key}
+              S3_ENDPOINT: https://rbbgirrboduoczusroow.storage.supabase.co/storage/v1/s3
+            notebook_path: ../src/02_ingestao_boto3_gabarito.py
+            source: WORKSPACE
+          run_if: ALL_SUCCESS
+          timeout_seconds: 0
+        - task_key: conferencia_bronze
+          depends_on:
+            - task_key: IngestaoAPI
+            - task_key: IngestaoAWS
+          sql_task:
+            file:
+              path: ../src/conferencia/00-conferencia-bronze.sql
+              source: WORKSPACE
+            warehouse_id: ${var.warehouse_id}
+        - task_key: medalhao
+          depends_on:
+            - task_key: conferencia_bronze
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.vertice_medalhao.id}
+        - task_key: testes_de_qualidade
+          depends_on:
+            - task_key: medalhao
+          sql_task:
+            file:
+              path: ../src/testes/testes.sql
+              source: WORKSPACE
+            warehouse_id: ${var.warehouse_id}
+        - task_key: status_com_ia
+          depends_on:
+            - task_key: medalhao
+          sql_task:
+            file:
+              path: ../src/ia/status_estruturado.sql
+              source: WORKSPACE
+            warehouse_id: ${var.warehouse_id}
+        - task_key: metricas_governadas
+          depends_on:
+            - task_key: testes_de_qualidade
+            - task_key: status_com_ia
+          sql_task:
+            file:
+              path: ../src/metricas/metricas.sql
+              source: WORKSPACE
+            warehouse_id: ${var.warehouse_id}
+      email_notifications:
+        no_alert_for_skipped_runs: false
+      max_concurrent_runs: 1
+      performance_target: PERFORMANCE_OPTIMIZED
+      queue:
+        enabled: true
+      schedule:
+        pause_status: UNPAUSED
+        quartz_cron_expression: 0 0 6 ? * MON
+        timezone_id: America/Sao_Paulo
+      timeout_seconds: 0
+      webhook_notifications: {}
